@@ -1,0 +1,58 @@
+﻿[package]
+name = "bloom-lib"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Probabilistic data structure library: Bloom filters, Cuckoo filters, Count-Min Sketch, HyperLogLog, MinHash, and Top-K. Tunable false-positive rates, serializable state, merge support, and streaming-safe updates."
+
+keywords = [
+    "bloom",
+    "probabilistic",
+    "hyperloglog",
+    "filter",
+    "rust"
+]
+
+categories = [
+    "data-structures",
+    "algorithms"
+]
+
+documentation = "https://docs.rs/bloom-lib"
+repository    = "https://github.com/jamesgober/bloom-lib"
+homepage      = "https://github.com/jamesgober/bloom-lib"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "bloom_lib"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
