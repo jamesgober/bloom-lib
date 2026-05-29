@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0] - 2026-05-28
+## [1.0.0] - 2026-05-29
 
 First stable release. The public API is frozen and follows SemVer from here; see
 [`docs/API.md#compatibility`](docs/API.md#compatibility). No functional changes
@@ -126,8 +126,4 @@ verification only. The full audit report is in `docs/release/v0.9.0.md`.
 - CI for Linux/macOS/Windows on stable and MSRV (1.75).
 
 [Unreleased]: https://github.com/jamesgober/bloom-lib/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/jamesgober/bloom-lib/compare/v0.9.0...v1.0.0
-[0.9.0]: https://github.com/jamesgober/bloom-lib/compare/v0.5.0...v0.9.0
-[0.5.0]: https://github.com/jamesgober/bloom-lib/compare/v0.2.0...v0.5.0
-[0.2.0]: https://github.com/jamesgober/bloom-lib/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/jamesgober/bloom-lib/releases/tag/v0.1.0
+[1.0.0]: https://github.com/jamesgober/bloom-lib/releases/tag/v1.0.0

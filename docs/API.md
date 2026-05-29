@@ -480,6 +480,21 @@ let similarity = a.similarity(&b).unwrap();
 assert!((0.45..=0.75).contains(&similarity));
 ```
 
+```rust
+// Merge two sketches to summarise the union of their sets, then compare the
+// merged sketch against one built directly from the union.
+use bloom_lib::MinHash;
+
+let mut a = MinHash::new(256).unwrap();
+let mut b = MinHash::new(256).unwrap();
+let mut union = MinHash::new(256).unwrap();
+for i in 0..500u32 { a.insert(&i); union.insert(&i); }
+for i in 500..1_000u32 { b.insert(&i); union.insert(&i); }
+
+a.merge(&b).unwrap();
+assert_eq!(a.similarity(&union).unwrap(), 1.0); // identical summaries
+```
+
 <br>
 
 <h3 id="topk"><code>TopK&lt;T, S = DefaultHashBuilder&gt;</code></h3>
@@ -522,6 +537,22 @@ for _ in 0..1   { top.insert("date"); }
 let ranked = top.top();
 assert_eq!(ranked[0].0, &"apple");
 assert_eq!(ranked.len(), 3); // only k kept
+```
+
+```rust
+// `estimate` works for any item, even one that fell out of the top set, and a
+// later surge can evict an earlier heavy hitter.
+use bloom_lib::TopK;
+
+let mut top = TopK::new(2, 0.0001, 0.0001).unwrap();
+for _ in 0..10 { top.insert("a"); }
+for _ in 0..5  { top.insert("b"); }
+for _ in 0..8  { top.insert("c"); } // outranks "b", evicts it
+
+assert!(top.estimate(&"b") >= 5);             // sketch still knows "b"'s count
+let keys: Vec<_> = top.top().iter().map(|&(k, _)| *k).collect();
+assert!(keys.contains(&"a") && keys.contains(&"c"));
+assert!(!keys.contains(&"b"));                // but "b" is no longer monitored
 ```
 
 <br>

@@ -11,16 +11,12 @@
 //! ## Available structures
 //!
 //! - [`BloomFilter`] — probabilistic set membership with a tunable
-//!   false-positive rate. *(since v0.2.0)*
+//!   false-positive rate.
 //! - [`CuckooFilter`] — approximate membership that also supports deletion.
-//!   *(since v0.5.0)*
 //! - [`CountMinSketch`] — approximate frequency estimation for a stream.
-//!   *(since v0.5.0)*
 //! - [`HyperLogLog`] — distinct-count (cardinality) estimation in tiny memory.
-//!   *(since v0.5.0)*
-//! - [`MinHash`] — Jaccard similarity estimation between sets. *(since v0.5.0)*
+//! - [`MinHash`] — Jaccard similarity estimation between sets.
 //! - [`TopK`] — the most frequent items (heavy hitters) in a stream.
-//!   *(since v0.5.0)*
 //!
 //! ## Example
 //!
