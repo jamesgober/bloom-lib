@@ -2,10 +2,11 @@
 
 use core::{hash::BuildHasher, marker::PhantomData};
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     hash::{DefaultHashBuilder, HashPair},
+    util::filled_vec,
     Error,
 };
 
@@ -46,7 +47,7 @@ use crate::{
 /// assert!((0.45..=0.75).contains(&similarity));
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct MinHash<T: ?Sized, S = DefaultHashBuilder> {
     signature: Vec<u64>,
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -69,7 +70,8 @@ impl<T: ?Sized> MinHash<T, DefaultHashBuilder> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `num_hashes` is zero.
+    /// Returns [`Error::InvalidParameter`] if `num_hashes` is zero or the
+    /// signature cannot be allocated.
     ///
     /// # Examples
     ///
@@ -91,7 +93,8 @@ impl<T: ?Sized, S: BuildHasher> MinHash<T, S> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `num_hashes` is zero.
+    /// Returns [`Error::InvalidParameter`] if `num_hashes` is zero or the
+    /// signature cannot be allocated.
     ///
     /// # Examples
     ///
@@ -112,7 +115,7 @@ impl<T: ?Sized, S: BuildHasher> MinHash<T, S> {
             });
         }
         Ok(Self {
-            signature: vec![u64::MAX; num_hashes],
+            signature: filled_vec(u64::MAX, num_hashes, "num_hashes")?,
             hasher,
             _marker: PhantomData,
         })
@@ -250,6 +253,45 @@ impl<T: ?Sized, S: BuildHasher> MinHash<T, S> {
     /// ```
     pub fn clear(&mut self) {
         self.signature.iter_mut().for_each(|slot| *slot = u64::MAX);
+    }
+
+    /// Returns the same sketch with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how a sketch
+    /// built with a keyed hasher is restored: deserialize it with the default
+    /// hasher type, then attach the original key. The signature is kept as it
+    /// is; nothing is rehashed. `hasher` must hash exactly like the one the
+    /// sketch was built with, or similarity estimates become meaningless.
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> MinHash<T, S2> {
+        MinHash {
+            signature: self.signature,
+            hasher,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: ?Sized, S: Default> serde::Deserialize<'de> for MinHash<T, S> {
+    /// Decodes a sketch and checks that its signature is not empty.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The serialized form, decoded before any invariant is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "MinHash")]
+        struct Raw {
+            signature: Vec<u64>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.signature.is_empty() {
+            return Err(crate::util::invalid("signature", "must not be empty"));
+        }
+        Ok(Self {
+            signature: raw.signature,
+            hasher: S::default(),
+            _marker: PhantomData,
+        })
     }
 }
 

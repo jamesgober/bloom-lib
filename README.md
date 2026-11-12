@@ -27,7 +27,7 @@ allocation-free, state is serializable, and compatible structures can be merged.
 
 The crate is `no_std`-friendly (it needs only `alloc`), carries no required
 runtime dependency, and is generic over the hash function so you can trade the
-fast deterministic default for an adversary-resistant one when inputs are
+fast deterministic default for the keyed `KeyedHashBuilder` when inputs are
 untrusted.
 
 ---
@@ -52,13 +52,13 @@ Every structure is generic over the item type and the hash function, supports
 
 ```toml
 [dependencies]
-bloom-lib = "1.0"
+bloom-lib = "1.1"
 
 # With serialization support:
-bloom-lib = { version = "1.0", features = ["serde"] }
+bloom-lib = { version = "1.1", features = ["serde"] }
 
 # On a heap-capable no_std target:
-bloom-lib = { version = "1.0", default-features = false, features = ["alloc"] }
+bloom-lib = { version = "1.1", default-features = false, features = ["alloc"] }
 ```
 
 ---
@@ -117,23 +117,62 @@ For the complete reference with parameters and worked examples, see
 Every structure is generic over [`core::hash::BuildHasher`] and defaults to the
 deterministic `DefaultHashBuilder`. A fixed seed makes hashing reproducible:
 filters built with the default hasher are always mergeable, and serialized state
-round-trips byte-for-byte across runs and platforms. The trade-off is that a
-fixed seed offers no defence against an adversary crafting colliding inputs. When
-inputs are untrusted, supply a randomly-seeded hasher such as
-`std::collections::hash_map::RandomState`:
+can be stored and queried later.
+
+Integers are hashed in little-endian byte order and lengths as 64-bit values on
+every target, so a key hashes to the same value on 32-bit and 64-bit,
+little-endian and big-endian machines, and state serialized on one can be
+queried on another. The values are the ones 1.0.0 produced on x86_64 and
+aarch64, so state written there by 1.0.0 stays valid. (1.0.0 used the native
+byte order and pointer width, so on 32-bit and big-endian targets it gave
+different hashes; see the changelog for 1.1.0.) One limit comes from the
+standard library: a slice or `Vec` of multi-byte integers (`[u32]`, `Vec<u64>`)
+is hashed as native-endian bytes, so use `[u8]`, `str` or single integers as
+keys for state that moves between machines of different byte order.
+
+The default hasher is a fast, non-cryptographic 64-bit hash. Its seed is
+public, so collisions can be computed directly and an attacker who chooses the
+keys can force false positives, inflate counts, or fill a Cuckoo filter with a
+handful of keys. When inputs are untrusted, use `KeyedHashBuilder`
+(SipHash-2-4 with a secret 128-bit key):
 
 ```rust
-use std::collections::hash_map::RandomState;
-use bloom_lib::BloomFilter;
+use bloom_lib::{hash::KeyedHashBuilder, BloomFilter};
 
-let filter: BloomFilter<&str, RandomState> =
-    BloomFilter::with_hasher(1_000, 0.01, RandomState::new()).unwrap();
+let hasher = KeyedHashBuilder::random(); // or KeyedHashBuilder::new(key)
+let filter: BloomFilter<str, KeyedHashBuilder> =
+    BloomFilter::with_hasher(1_000, 0.01, hasher).unwrap();
 ```
 
-The default hasher is a fast, non-cryptographic 64-bit hash with strong
-avalanche behaviour. From a single hashing pass the structures synthesise the
-many index positions they need using the Kirsch–Mitzenmacher double-hashing
-scheme, and map hashes into range with a division-free multiply-shift reduction.
+Serialized state does not include the hasher. A keyed structure is restored by
+deserializing it with the default hasher type and attaching the same key again
+with `replace_hasher`; store the key (`KeyedHashBuilder::key`) separately, as a
+secret. Do not persist structures built with
+`std::collections::hash_map::RandomState`: deserializing rebuilds it with
+`RandomState::default()`, which draws a new random key, and the restored
+structure then reports almost every stored item as absent.
+
+From a single hashing pass the structures synthesise the many index positions
+they need using the Kirsch-Mitzenmacher double-hashing scheme, and map hashes
+into range with a division-free multiply-shift reduction.
+
+## Security: deserializing untrusted state
+
+With the `serde` feature, `Deserialize` checks every field against the others
+and against the size of the data: word count against bit count, counter count
+against width and depth, register count against precision, table size against
+the bucket mask, stored length against the stored fingerprints, and a cap of
+2,048 on the Bloom hash count. Inconsistent input fails with an error instead of
+producing a structure that panics, or loops for as long as the input says, on
+its first query. The work one query does is bounded by that cap or by the size
+of the data.
+
+Validation cannot tell whether the content is honest. A peer can still send a
+well-formed filter with every bit set, or a sketch with inflated counters. Only
+merge or trust state from sources you trust for the answers it gives.
+
+Constructors return `Error::InvalidParameter` for sizes that overflow or cannot
+be allocated, instead of aborting the process.
 
 [`core::hash::BuildHasher`]: https://doc.rust-lang.org/core/hash/trait.BuildHasher.html
 
@@ -145,7 +184,8 @@ The hot paths are allocation-free and use only integer arithmetic: one hashing
 pass per item, then a handful of multiply-shift index computations and array
 probes. Floating-point math runs only at construction, via
 [`libm`](https://crates.io/crates/libm), so a structure's derived geometry is
-bit-identical on every platform.
+bit-identical on every platform, and so are the hash values (see
+[Hashing](#hashing)).
 
 Latest local Criterion means (`cargo bench --bench probabilistic`, Windows
 x86_64, Rust stable, steady-state on a pre-populated structure):
@@ -173,7 +213,7 @@ x86_64, Rust stable, steady-state on a pre-populated structure):
 |---------|---------|-------------|
 | `std`   | ✅ | Enables every structure and the `std::error::Error` impl for `Error`. Implies `alloc`. |
 | `alloc` | — | Enables every structure without `std`, for heap-capable `no_std` targets. |
-| `serde` | — | Derives `Serialize`/`Deserialize` for every structure. Implies `alloc`. |
+| `serde` | no | `Serialize` and a validating `Deserialize` for every structure. Implies `alloc`. |
 
 With no features enabled the crate still compiles and exposes `VERSION` and
 `Error`, so it can sit in a `no_std` dependency tree without pulling in a heap.
@@ -222,7 +262,10 @@ cargo bench --bench probabilistic
 Tier-1 targets — Linux, macOS, and Windows (x86_64 and aarch64) — compile and
 pass the full suite on both stable and the MSRV (Rust 1.75). CI runs formatting,
 clippy with `-D warnings`, the test suite, and a documentation build with
-`RUSTDOCFLAGS=-D warnings` across all three operating systems.
+`RUSTDOCFLAGS=-D warnings` across all three operating systems. A separate job
+runs the suite on a 32-bit target (i686) and a big-endian target (s390x), where
+golden tests check that hash values and serialized state match what 1.0.0
+produced on x86_64.
 
 ---
 

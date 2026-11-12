@@ -19,6 +19,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-11-12
+
+Fixes from an independent review: hashing is now the same on every target,
+deserialization validates its input, oversized constructor parameters return
+errors, and a keyed hasher is available for untrusted input. No breaking API
+change and no MSRV change (still Rust 1.75).
+
+### Compatibility
+
+- **Hash values and serialized state on x86_64 and aarch64 are unchanged.**
+  `tests/golden.rs` pins hash values for byte slices, strings and every integer
+  type, and the full serialized form of every structure, to what 1.0.0
+  produced on x86_64. Filters written there by 1.0.0 decode and answer queries
+  exactly as before.
+- On 32-bit and big-endian targets, hash values change to match x86_64 (see
+  Fixed). State that 1.0.0 serialized *on those targets* gives false negatives
+  under 1.1.0; rebuild it. State serialized on x86_64 or aarch64 now works on
+  them, which it did not before.
+- From 1.1.0 the hash values and the serialized form are held fixed for the
+  rest of 1.x (see `docs/API.md#compatibility`).
+
+### Added
+
+- `hash::KeyedHasher` and `hash::KeyedHashBuilder`: SipHash-2-4 with a 128-bit
+  secret key, for inputs an adversary can choose. `KeyedHashBuilder::new`,
+  `random` (with `std`) and `key`. Neither type prints its key in `Debug`.
+  `KeyedHashBuilder` has no `Default`, so a keyed structure cannot be
+  deserialized with a made-up key. Both are in the prelude.
+- `replace_hasher` on every structure, to attach the original key after
+  deserializing a keyed structure (serialized state never includes the
+  hasher).
+- Golden compatibility tests, tests for hostile serialized state, constructor
+  limits and the keyed hasher, and a CI job that runs the test suite on
+  `i686-unknown-linux-gnu` and big-endian `s390x-unknown-linux-gnu`.
+
+### Changed
+
+- `BloomFilter::with_dimensions` and `with_dimensions_and_hasher` reject
+  `num_hashes` above 2,048 with `Error::InvalidParameter`. The sizing formulas
+  never produce more than about 1,075, so `new` and `with_hasher` are not
+  affected.
+- Docs: the `RandomState` advice is replaced by `KeyedHashBuilder`; the docs
+  now say that a `RandomState` structure must not be persisted (deserializing
+  draws a new key and the restored structure reports almost every item
+  absent); `DefaultHasher` is no longer described as resistant to anything; the
+  Cuckoo `capacity()` docs say it counts slots and can be up to twice the
+  requested capacity, and the false-positive rate is stated as an upper bound
+  at full load.
+
+### Fixed
+
+- **Hashing depended on the target's byte order and pointer width.** The
+  hashers used the standard library's default integer writes, which feed
+  native-endian bytes and a native-width `usize`. The `[u8]` and `str` length
+  prefix was 4 bytes on 32-bit targets, and integer keys were byte-swapped on
+  big-endian targets, so a filter serialized on x86_64 reported stored keys as
+  absent on i686, armv7, wasm32 or s390x. Both hashers now feed integers in
+  little-endian order and widen `usize`/`isize` to 64 bits on every target.
+- **Constructors aborted or panicked on oversized parameters** although they
+  return `Result`. Sizes are now computed with checked arithmetic and
+  allocated with `try_reserve_exact`, and failures return
+  `Error::InvalidParameter`: `BloomFilter::with_dimensions(u64::MAX, 1)`
+  aborted the process, `CountMinSketch::with_dimensions(usize::MAX / 2 + 2, 2)`
+  overflowed, `CuckooFilter::new(usize::MAX / 4)` panicked, and on 32-bit
+  targets a large bit count was truncated.
+
+### Security
+
+- **`Deserialize` accepted any field values.** Hostile bytes could make a
+  structure panic on its first query, loop for as long as the input said
+  (Count-Min with width 0 and a depth of 2^64, or a Bloom hash count of
+  2^32), or answer every query wrongly (a Bloom hash count of 0 made every
+  item present). Every structure now has a validating `Deserialize` that
+  checks each field against the others and against the size of the data, and
+  returns an error. The serialized format itself is unchanged. The checks are
+  listed in `docs/API.md#untrusted-state`.
+- **Collisions in the default hasher can be computed directly**, and the only
+  alternative the docs offered (`RandomState`) broke on a serde round trip.
+  `KeyedHashBuilder` closes both gaps.
+
+### Third-party dependencies
+
+Unchanged: `libm` (always) and `serde` (optional, `serde` feature).
+
+---
+
 ## [1.0.0] - 2026-05-29
 
 First stable release. The public API is frozen and follows SemVer from here; see
@@ -125,5 +211,6 @@ verification only. The full audit report is in `docs/release/v0.9.0.md`.
 - REPS compliance baseline.
 - CI for Linux/macOS/Windows on stable and MSRV (1.75).
 
-[Unreleased]: https://github.com/jamesgober/bloom-lib/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/bloom-lib/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/bloom-lib/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/bloom-lib/releases/tag/v1.0.0

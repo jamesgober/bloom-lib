@@ -42,3 +42,23 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  cross:
+    # Hash values and serialized state must be identical on every target.
+    # tests/golden.rs pins them to what 1.0.0 produced on x86_64; these jobs
+    # run it on a 32-bit target and on a big-endian target.
+    name: Cross (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [i686-unknown-linux-gnu, s390x-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross test --target ${{ matrix.target }} --all-features --lib --tests

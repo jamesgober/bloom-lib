@@ -7,14 +7,16 @@
 //! caller derives its index from [`crate::hash::reduce`], which is already
 //! bounded by the bit count.
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
+
+use crate::{util::filled_vec, Error};
 
 /// Number of bits in a backing word.
 const WORD_BITS: u64 = 64;
 
 /// A fixed-length sequence of bits packed into `u64` words.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub(crate) struct BitSet {
     words: Vec<u64>,
     num_bits: u64,
@@ -22,13 +24,20 @@ pub(crate) struct BitSet {
 
 impl BitSet {
     /// Allocates a bit set with `num_bits` bits, all cleared to zero.
+    ///
+    /// Fails with [`Error::InvalidParameter`] (naming `num_bits`) when the
+    /// word count does not fit in `usize` or cannot be allocated.
     #[inline]
-    pub(crate) fn new(num_bits: u64) -> Self {
-        let num_words = num_bits.div_ceil(WORD_BITS) as usize;
-        Self {
-            words: vec![0u64; num_words],
+    pub(crate) fn try_new(num_bits: u64) -> Result<Self, Error> {
+        let num_words =
+            usize::try_from(num_bits.div_ceil(WORD_BITS)).map_err(|_| Error::InvalidParameter {
+                param: "num_bits",
+                reason: crate::util::TOO_LARGE,
+            })?;
+        Ok(Self {
+            words: filled_vec(0u64, num_words, "num_bits")?,
             num_bits,
-        }
+        })
     }
 
     /// The number of bits the set can hold.
@@ -84,5 +93,42 @@ impl BitSet {
         for (dst, src) in self.words.iter_mut().zip(other.words.iter()) {
             *dst |= *src;
         }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for BitSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::util::invalid;
+
+        /// The serialized form, decoded before any invariant is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "BitSet")]
+        struct Raw {
+            words: Vec<u64>,
+            num_bits: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.num_bits == 0 {
+            return Err(invalid("num_bits", "must be greater than zero"));
+        }
+        if raw.words.len() as u64 != raw.num_bits.div_ceil(WORD_BITS) {
+            return Err(invalid(
+                "words",
+                "word count does not match the bit count (expected ceil(num_bits / 64))",
+            ));
+        }
+        let used = raw.num_bits % WORD_BITS;
+        if used != 0 {
+            let unused_mask = !0u64 << used;
+            if raw.words.last().is_some_and(|last| last & unused_mask != 0) {
+                return Err(invalid("words", "bits beyond num_bits are set"));
+            }
+        }
+        Ok(Self {
+            words: raw.words,
+            num_bits: raw.num_bits,
+        })
     }
 }

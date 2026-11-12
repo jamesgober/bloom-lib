@@ -11,6 +11,14 @@ use crate::{
 /// Natural logarithm of 2, reused by the sizing formulas.
 const LN_2: f64 = core::f64::consts::LN_2;
 
+/// Largest accepted hash count.
+///
+/// Each query probes `num_hashes` bits, so the count bounds the cost of a
+/// query. The sizing formulas never produce more than about 1,075 (the hash
+/// count for the smallest positive `f64` rate), so this cap only rejects
+/// geometries no constructor would choose and hostile serialized state.
+pub(crate) const MAX_NUM_HASHES: u32 = 2048;
+
 /// A space-efficient probabilistic set membership test.
 ///
 /// A Bloom filter answers "have I seen this item?" using a fraction of the
@@ -44,7 +52,7 @@ const LN_2: f64 = core::f64::consts::LN_2;
 /// assert!(!filter.contains("carol")); // very likely absent
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BloomFilter<T: ?Sized, S = DefaultHashBuilder> {
     bits: BitSet,
     num_hashes: u32,
@@ -70,8 +78,9 @@ impl<T: ?Sized> BloomFilter<T, DefaultHashBuilder> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `capacity` is zero or `rate` is
-    /// not a finite value strictly between `0.0` and `1.0`.
+    /// Returns [`Error::InvalidParameter`] if `capacity` is zero, `rate` is
+    /// not a finite value strictly between `0.0` and `1.0`, or the bit array
+    /// the two imply cannot be allocated.
     ///
     /// # Examples
     ///
@@ -95,12 +104,13 @@ impl<T: ?Sized> BloomFilter<T, DefaultHashBuilder> {
     /// # Parameters
     ///
     /// - `num_bits`: size of the bit array. Must be non-zero.
-    /// - `num_hashes`: number of hash positions probed per item. Must be
-    ///   non-zero.
+    /// - `num_hashes`: number of hash positions probed per item. Must be in
+    ///   `1..=2048`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if either argument is zero.
+    /// Returns [`Error::InvalidParameter`] if either argument is zero,
+    /// `num_hashes` is above 2048, or the bit array cannot be allocated.
     ///
     /// # Examples
     ///
@@ -126,8 +136,9 @@ impl<T: ?Sized, S: BuildHasher> BloomFilter<T, S> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `capacity` is zero or `rate` is
-    /// not a finite value strictly between `0.0` and `1.0`.
+    /// Returns [`Error::InvalidParameter`] if `capacity` is zero, `rate` is
+    /// not a finite value strictly between `0.0` and `1.0`, or the bit array
+    /// the two imply cannot be allocated.
     ///
     /// # Examples
     ///
@@ -164,7 +175,8 @@ impl<T: ?Sized, S: BuildHasher> BloomFilter<T, S> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidParameter`] if `num_bits` or `num_hashes` is
-    /// zero.
+    /// zero, `num_hashes` is above 2048, or the bit array cannot be
+    /// allocated.
     ///
     /// # Examples
     ///
@@ -190,15 +202,10 @@ impl<T: ?Sized, S: BuildHasher> BloomFilter<T, S> {
                 reason: "must be greater than zero",
             });
         }
-        if num_hashes == 0 {
-            return Err(Error::InvalidParameter {
-                param: "num_hashes",
-                reason: "must be greater than zero",
-            });
-        }
+        check_num_hashes(num_hashes)?;
 
         Ok(Self {
-            bits: BitSet::new(num_bits),
+            bits: BitSet::try_new(num_bits)?,
             num_hashes,
             hasher,
             _marker: PhantomData,
@@ -424,6 +431,84 @@ impl<T: ?Sized, S: BuildHasher> BloomFilter<T, S> {
         }
         self.bits.union_with(&other.bits);
         Ok(())
+    }
+}
+
+impl<T: ?Sized, S> BloomFilter<T, S> {
+    /// Returns the same filter with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how a filter
+    /// built with a keyed hasher is restored: deserialize it with the default
+    /// hasher type, then attach the original key. The bits are kept as they
+    /// are; nothing is rehashed. `hasher` must hash exactly like the one the
+    /// filter was built with, or lookups give false negatives.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bloom_lib::{hash::KeyedHashBuilder, BloomFilter};
+    ///
+    /// let key = [3u8; 16];
+    /// let mut filter = BloomFilter::<str, _>::with_hasher(100, 0.01, KeyedHashBuilder::new(key))
+    ///     .unwrap();
+    /// filter.insert("kept");
+    ///
+    /// // For example after a serde round trip into `BloomFilter<str>`:
+    /// let plain: BloomFilter<str> = filter.replace_hasher(Default::default());
+    /// let restored = plain.replace_hasher(KeyedHashBuilder::new(key));
+    /// assert!(restored.contains("kept"));
+    /// ```
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> BloomFilter<T, S2> {
+        BloomFilter {
+            bits: self.bits,
+            num_hashes: self.num_hashes,
+            hasher,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Checks a hash count against `1..=MAX_NUM_HASHES`.
+fn check_num_hashes(num_hashes: u32) -> Result<(), Error> {
+    if num_hashes == 0 {
+        return Err(Error::InvalidParameter {
+            param: "num_hashes",
+            reason: "must be greater than zero",
+        });
+    }
+    if num_hashes > MAX_NUM_HASHES {
+        return Err(Error::InvalidParameter {
+            param: "num_hashes",
+            reason: "must be at most 2048",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: ?Sized, S: Default> serde::Deserialize<'de> for BloomFilter<T, S> {
+    /// Decodes a filter and checks it: the bit set's word count must match
+    /// its bit count, no bit beyond the bit count may be set, and the hash
+    /// count must be in `1..=2048`. Inconsistent input is an error, never a
+    /// filter that panics or stalls on its first query.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The serialized form, decoded before the hash count is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "BloomFilter")]
+        struct Raw {
+            bits: BitSet,
+            num_hashes: u32,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        check_num_hashes(raw.num_hashes).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            bits: raw.bits,
+            num_hashes: raw.num_hashes,
+            hasher: S::default(),
+            _marker: PhantomData,
+        })
     }
 }
 

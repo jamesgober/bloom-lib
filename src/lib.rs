@@ -37,18 +37,29 @@
 //!
 //! Every structure is generic over [`core::hash::BuildHasher`] and defaults to
 //! the deterministic [`hash::DefaultHashBuilder`]. Determinism makes filters
-//! reproducible, mergeable, and stable across serialization. Supply a
-//! randomly-seeded hasher when the inputs are adversarial. See the [`hash`]
-//! module for details.
+//! reproducible, mergeable, and stable across serialization, and the hash of a
+//! given key is the same on every target. When an adversary can choose the
+//! inputs, use [`hash::KeyedHashBuilder`] with a secret key. See the [`hash`]
+//! module for details, including how to persist a keyed structure.
+//!
+//! ## Untrusted serialized state
+//!
+//! With the `serde` feature, deserializing checks every field against the
+//! others and against the size of the data (bit count against word count,
+//! register count against precision, table size against the bucket mask, and
+//! so on) and fails with an error instead of producing a structure that
+//! panics or loops on its first query. The work one query does is bounded by
+//! a fixed cap on the hash count or by the size of the data. Validation cannot tell whether the content
+//! is honest: a peer can still send a filter that says every item is present.
 //!
 //! ## Feature flags
 //!
-//! - `std` *(default)* — enables every structure and the
+//! - `std` *(default)*: enables every structure and the
 //!   [`std::error::Error`] implementation for [`Error`].
-//! - `alloc` — enables every structure without requiring `std`, for
+//! - `alloc`: enables every structure without requiring `std`, for
 //!   heap-capable `no_std` targets. Implied by `std`.
-//! - `serde` — derives `Serialize`/`Deserialize` for every structure. Implies
-//!   `alloc`.
+//! - `serde`: implements `Serialize` and a validating `Deserialize` for every
+//!   structure. Implies `alloc`.
 //!
 //! With none of these features the crate exposes only [`VERSION`] and [`Error`].
 //!
@@ -79,6 +90,8 @@ extern crate alloc;
 
 mod error;
 pub mod hash;
+#[cfg(feature = "alloc")]
+mod util;
 
 pub use crate::error::Error;
 
@@ -125,7 +138,7 @@ pub use crate::topk::TopK;
 /// # }
 /// ```
 pub mod prelude {
-    pub use crate::hash::{DefaultHashBuilder, DefaultHasher};
+    pub use crate::hash::{DefaultHashBuilder, DefaultHasher, KeyedHashBuilder, KeyedHasher};
     pub use crate::Error;
 
     #[cfg(feature = "alloc")]

@@ -2,10 +2,11 @@
 
 use core::{hash::BuildHasher, marker::PhantomData};
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     hash::{reduce, DefaultHashBuilder, HashPair},
+    util::{filled_vec, TOO_LARGE},
     Error,
 };
 
@@ -42,7 +43,7 @@ const E: f64 = core::f64::consts::E;
 /// assert_eq!(sketch.estimate("cherry"), 0);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CountMinSketch<T: ?Sized, S = DefaultHashBuilder> {
     counters: Vec<u64>,
     width: usize,
@@ -73,7 +74,8 @@ impl<T: ?Sized> CountMinSketch<T, DefaultHashBuilder> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidParameter`] if either argument is not a finite
-    /// value in the open interval `(0.0, 1.0)`.
+    /// value in the open interval `(0.0, 1.0)`, or the counter grid they imply
+    /// cannot be allocated.
     ///
     /// # Examples
     ///
@@ -98,7 +100,8 @@ impl<T: ?Sized> CountMinSketch<T, DefaultHashBuilder> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if either argument is zero.
+    /// Returns [`Error::InvalidParameter`] if either argument is zero, or
+    /// `width * depth` overflows or cannot be allocated.
     ///
     /// # Examples
     ///
@@ -120,7 +123,8 @@ impl<T: ?Sized, S: BuildHasher> CountMinSketch<T, S> {
     /// # Errors
     ///
     /// Returns [`Error::InvalidParameter`] if either argument is not a finite
-    /// value in `(0.0, 1.0)`.
+    /// value in `(0.0, 1.0)`, or the counter grid they imply cannot be
+    /// allocated.
     ///
     /// # Examples
     ///
@@ -156,7 +160,8 @@ impl<T: ?Sized, S: BuildHasher> CountMinSketch<T, S> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `width` or `depth` is zero.
+    /// Returns [`Error::InvalidParameter`] if `width` or `depth` is zero, or
+    /// `width * depth` overflows or cannot be allocated.
     pub fn with_dimensions_and_hasher(
         width: usize,
         depth: usize,
@@ -175,8 +180,13 @@ impl<T: ?Sized, S: BuildHasher> CountMinSketch<T, S> {
             });
         }
 
+        let cells = width.checked_mul(depth).ok_or(Error::InvalidParameter {
+            param: "width",
+            reason: TOO_LARGE,
+        })?;
+
         Ok(Self {
-            counters: vec![0u64; width * depth],
+            counters: filled_vec(0u64, cells, "width")?,
             width,
             depth,
             total: 0,
@@ -355,6 +365,69 @@ impl<T: ?Sized, S: BuildHasher> CountMinSketch<T, S> {
         }
         self.total = self.total.saturating_add(other.total);
         Ok(())
+    }
+}
+
+impl<T: ?Sized, S> CountMinSketch<T, S> {
+    /// Returns the same sketch with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how a sketch
+    /// built with a keyed hasher is restored: deserialize it with the default
+    /// hasher type, then attach the original key. The counters are kept as
+    /// they are; nothing is rehashed. `hasher` must hash exactly like the one
+    /// the sketch was built with, or estimates become meaningless.
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> CountMinSketch<T, S2> {
+        CountMinSketch {
+            counters: self.counters,
+            width: self.width,
+            depth: self.depth,
+            total: self.total,
+            hasher,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: ?Sized, S: Default> serde::Deserialize<'de> for CountMinSketch<T, S> {
+    /// Decodes a sketch and checks it: `width` and `depth` must be non-zero
+    /// and the counter count must equal `width * depth`. The depth, and so
+    /// the work per query, is therefore bounded by the size of the input.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::util::invalid;
+
+        /// The serialized form, decoded before any invariant is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "CountMinSketch")]
+        struct Raw {
+            counters: Vec<u64>,
+            width: usize,
+            depth: usize,
+            total: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.width == 0 {
+            return Err(invalid("width", "must be greater than zero"));
+        }
+        if raw.depth == 0 {
+            return Err(invalid("depth", "must be greater than zero"));
+        }
+        if raw.width.checked_mul(raw.depth) != Some(raw.counters.len()) {
+            return Err(invalid(
+                "counters",
+                "counter count does not match width * depth",
+            ));
+        }
+        Ok(Self {
+            counters: raw.counters,
+            width: raw.width,
+            depth: raw.depth,
+            total: raw.total,
+            hasher: S::default(),
+            _marker: PhantomData,
+        })
     }
 }
 
