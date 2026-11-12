@@ -44,7 +44,7 @@ const MAX_PRECISION: u8 = 18;
 /// assert!((97_000..=103_000).contains(&estimate));
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct HyperLogLog<T: ?Sized, S = DefaultHashBuilder> {
     registers: Vec<u8>,
     precision: u8,
@@ -301,6 +301,68 @@ impl<T: ?Sized, S: BuildHasher> HyperLogLog<T, S> {
             *dst = (*dst).max(*src);
         }
         Ok(())
+    }
+}
+
+impl<T: ?Sized, S> HyperLogLog<T, S> {
+    /// Returns the same estimator with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how an
+    /// estimator built with a keyed hasher is restored: deserialize it with
+    /// the default hasher type, then attach the original key. The registers
+    /// are kept as they are; nothing is rehashed. `hasher` must hash exactly
+    /// like the one the estimator was built with, or items already counted
+    /// are counted again.
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> HyperLogLog<T, S2> {
+        HyperLogLog {
+            registers: self.registers,
+            precision: self.precision,
+            hasher,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: ?Sized, S: Default> serde::Deserialize<'de> for HyperLogLog<T, S> {
+    /// Decodes an estimator and checks it: `precision` must be in `4..=18`,
+    /// there must be exactly `2^precision` registers, and no register may
+    /// exceed the largest rank an insertion can produce (`65 - precision`).
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::util::invalid;
+
+        /// The serialized form, decoded before any invariant is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "HyperLogLog")]
+        struct Raw {
+            registers: Vec<u8>,
+            precision: u8,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if !(MIN_PRECISION..=MAX_PRECISION).contains(&raw.precision) {
+            return Err(invalid("precision", "must be in the range 4..=18"));
+        }
+        if raw.registers.len() != 1usize << raw.precision {
+            return Err(invalid(
+                "registers",
+                "register count does not match the precision (expected 2^precision)",
+            ));
+        }
+        let max_rank = 65 - raw.precision;
+        if raw.registers.iter().any(|&register| register > max_rank) {
+            return Err(invalid(
+                "registers",
+                "a register exceeds the largest possible rank",
+            ));
+        }
+        Ok(Self {
+            registers: raw.registers,
+            precision: raw.precision,
+            hasher: S::default(),
+            _marker: PhantomData,
+        })
     }
 }
 

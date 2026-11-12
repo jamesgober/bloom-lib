@@ -2,10 +2,11 @@
 
 use core::{hash::BuildHasher, marker::PhantomData};
 
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::{
     hash::{mix64, DefaultHashBuilder},
+    util::{filled_vec, TOO_LARGE},
     Error,
 };
 
@@ -41,8 +42,10 @@ struct Victim {
 /// The filter stores a short *fingerprint* of each item (16 bits here) in one of
 /// two candidate buckets, relocating existing fingerprints as needed to make
 /// room — the "cuckoo" behaviour. The false-positive rate is fixed by the
-/// fingerprint width at roughly 0.012%; for a tunable rate without deletion, use
-/// a [`BloomFilter`](crate::BloomFilter).
+/// fingerprint width at most about 0.012%, reached when the table is full; at
+/// the requested capacity the table is often only half full and the rate is
+/// lower. For a tunable rate without deletion, use a
+/// [`BloomFilter`](crate::BloomFilter).
 ///
 /// The filter is generic over the item type `T` and a
 /// [`BuildHasher`](core::hash::BuildHasher) `S`, defaulting to the deterministic
@@ -62,7 +65,7 @@ struct Victim {
 /// assert!(!filter.contains("alice"));
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CuckooFilter<T: ?Sized, S = DefaultHashBuilder> {
     buckets: Vec<u16>,
     mask: usize,
@@ -91,7 +94,8 @@ impl<T: ?Sized> CuckooFilter<T, DefaultHashBuilder> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `capacity` is zero.
+    /// Returns [`Error::InvalidParameter`] if `capacity` is zero or the table
+    /// it implies cannot be allocated.
     ///
     /// # Examples
     ///
@@ -113,7 +117,8 @@ impl<T: ?Sized, S: BuildHasher> CuckooFilter<T, S> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidParameter`] if `capacity` is zero.
+    /// Returns [`Error::InvalidParameter`] if `capacity` is zero or the table
+    /// it implies cannot be allocated.
     ///
     /// # Examples
     ///
@@ -134,14 +139,24 @@ impl<T: ?Sized, S: BuildHasher> CuckooFilter<T, S> {
             });
         }
 
-        let num_buckets = capacity_to_buckets(capacity);
+        let slots = capacity_to_buckets(capacity).and_then(|buckets| {
+            buckets
+                .checked_mul(BUCKET_SIZE)
+                .map(|slots| (buckets, slots))
+        });
+        let Some((num_buckets, slots)) = slots else {
+            return Err(Error::InvalidParameter {
+                param: "capacity",
+                reason: TOO_LARGE,
+            });
+        };
         Ok(Self {
-            buckets: vec![EMPTY; num_buckets * BUCKET_SIZE],
+            buckets: filled_vec(EMPTY, slots, "capacity")?,
             mask: num_buckets - 1,
             len: 0,
             victim: None,
             // Non-zero xorshift seed derived from the table size.
-            rng_state: 0x9E37_79B9_7F4A_7C15 ^ num_buckets as u64,
+            rng_state: 0x9e37_79b9_7f4a_7c15 ^ num_buckets as u64,
             hasher,
             _marker: PhantomData,
         })
@@ -328,10 +343,12 @@ impl<T: ?Sized, S: BuildHasher> CuckooFilter<T, S> {
         self.len == 0
     }
 
-    /// The maximum number of fingerprints the table can hold.
+    /// The number of fingerprint slots in the table.
     ///
-    /// This is `num_buckets * 4`. Practical fill tops out a little below this
-    /// value before insertions start to fail.
+    /// This is `num_buckets * 4`. The bucket count is rounded up to a power of
+    /// two, so this can be up to about twice the capacity passed to
+    /// [`new`](CuckooFilter::new), and memory use follows it. Practical fill
+    /// tops out a little below this value before insertions start to fail.
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> usize {
@@ -430,6 +447,93 @@ impl<T: ?Sized, S: BuildHasher> CuckooFilter<T, S> {
     }
 }
 
+impl<T: ?Sized, S> CuckooFilter<T, S> {
+    /// Returns the same filter with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how a filter
+    /// built with a keyed hasher is restored: deserialize it with the default
+    /// hasher type, then attach the original key. The table is kept as it
+    /// is; nothing is rehashed. `hasher` must hash exactly like the one the
+    /// filter was built with, or lookups give false negatives and removals
+    /// delete the wrong fingerprints.
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> CuckooFilter<T, S2> {
+        CuckooFilter {
+            buckets: self.buckets,
+            mask: self.mask,
+            len: self.len,
+            victim: self.victim,
+            rng_state: self.rng_state,
+            hasher,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: ?Sized, S: Default> serde::Deserialize<'de> for CuckooFilter<T, S> {
+    /// Decodes a filter and checks it: the bucket count (`mask + 1`) must be a
+    /// power of two, the table must hold exactly four slots per bucket, a
+    /// held-out victim must be non-empty and point at a real bucket, `len`
+    /// must equal the number of stored fingerprints, and the relocation
+    /// generator state must be non-zero.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::util::invalid;
+
+        /// The serialized form, decoded before any invariant is checked.
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "CuckooFilter")]
+        struct Raw {
+            buckets: Vec<u16>,
+            mask: usize,
+            len: usize,
+            victim: Option<Victim>,
+            rng_state: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let num_buckets = raw
+            .mask
+            .checked_add(1)
+            .filter(|n| n.is_power_of_two())
+            .ok_or_else(|| invalid("mask", "mask + 1 must be a power of two"))?;
+        if num_buckets.checked_mul(BUCKET_SIZE) != Some(raw.buckets.len()) {
+            return Err(invalid(
+                "buckets",
+                "slot count does not match the bucket count (expected 4 * (mask + 1))",
+            ));
+        }
+        if let Some(victim) = raw.victim {
+            if victim.fingerprint == EMPTY {
+                return Err(invalid("victim", "fingerprint must be non-zero"));
+            }
+            if victim.index >= num_buckets {
+                return Err(invalid("victim", "bucket index is out of range"));
+            }
+        }
+        let stored = raw.buckets.iter().filter(|&&slot| slot != EMPTY).count()
+            + usize::from(raw.victim.is_some());
+        if raw.len != stored {
+            return Err(invalid(
+                "len",
+                "does not match the number of stored fingerprints",
+            ));
+        }
+        if raw.rng_state == 0 {
+            return Err(invalid("rng_state", "must be non-zero"));
+        }
+        Ok(Self {
+            buckets: raw.buckets,
+            mask: raw.mask,
+            len: raw.len,
+            victim: raw.victim,
+            rng_state: raw.rng_state,
+            hasher: S::default(),
+            _marker: PhantomData,
+        })
+    }
+}
+
 /// Derives a non-zero 16-bit fingerprint from the high bits of a 64-bit hash.
 #[inline]
 fn fingerprint_of(hash: u64) -> u16 {
@@ -442,10 +546,15 @@ fn fingerprint_of(hash: u64) -> u16 {
 }
 
 /// Rounds a capacity up to a power-of-two bucket count with ~5% headroom.
-fn capacity_to_buckets(capacity: usize) -> usize {
+///
+/// Returns `None` when the bucket count does not fit in `usize`.
+fn capacity_to_buckets(capacity: usize) -> Option<usize> {
     let target_load = 0.95;
-    let raw = libm::ceil(capacity as f64 / (BUCKET_SIZE as f64 * target_load)) as usize;
-    raw.max(1).next_power_of_two()
+    let raw = libm::ceil(capacity as f64 / (BUCKET_SIZE as f64 * target_load));
+    if raw >= usize::MAX as f64 {
+        return None;
+    }
+    (raw as usize).max(1).checked_next_power_of_two()
 }
 
 #[cfg(test)]

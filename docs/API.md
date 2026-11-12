@@ -39,6 +39,9 @@ examples for each use case. The same content is available inline on
   - [Hashing](#hashing)
     - [`DefaultHasher`](#defaulthasher)
     - [`DefaultHashBuilder`](#defaulthashbuilder)
+    - [`KeyedHasher`](#keyedhasher)
+    - [`KeyedHashBuilder`](#keyedhashbuilder)
+  - [Untrusted serialized state](#untrusted-state)
   - [`Error`](#error)
   - [`VERSION`](#version)
   - [Prelude](#prelude)
@@ -69,7 +72,7 @@ bloom-lib = { version = "1.0", default-features = false, features = ["alloc"] }
 |---------|---------|--------|
 | `std`   | yes | Enables every structure and `impl std::error::Error for Error`. Implies `alloc`. |
 | `alloc` | no  | Enables every structure on heap-capable `no_std` targets. |
-| `serde` | no  | Derives `Serialize`/`Deserialize` for every structure. Implies `alloc`. |
+| `serde` | no  | `Serialize` and a validating `Deserialize` for every structure. Implies `alloc`. |
 
 With no features the crate exposes only [`VERSION`](#version) and
 [`Error`](#error).
@@ -107,8 +110,8 @@ filter cannot enumerate or delete its contents.
 - `S` — the [`BuildHasher`](https://doc.rust-lang.org/core/hash/trait.BuildHasher.html)
   used to hash items. Defaults to [`DefaultHashBuilder`](#defaulthashbuilder).
 
-**Derives:** `Debug`, `Clone`, and — under the `serde` feature —
-`Serialize`/`Deserialize`.
+**Derives:** `Debug`, `Clone`, and under the `serde` feature `Serialize`, plus
+a validating `Deserialize`.
 
 <h4 id="bloomfilter-construction">Construction</h4>
 
@@ -127,12 +130,14 @@ filter cannot enumerate or delete its contents.
 - `rate`: the target false-positive probability. Must be a finite value in the
   open interval `(0.0, 1.0)`.
 - `num_bits`: the exact size of the bit array. Must be non-zero.
-- `num_hashes`: the number of hash positions probed per item. Must be non-zero.
-- `hasher`: any `BuildHasher`. Use a randomly-seeded one (such as
-  `RandomState`) when inputs are adversarial.
+- `num_hashes`: the number of hash positions probed per item. Must be in
+  `1..=2048` (the sizing formulas never produce more than about 1,075).
+- `hasher`: any `BuildHasher`. Use [`KeyedHashBuilder`](#keyedhashbuilder)
+  when inputs are adversarial.
 
 **Errors:** [`Error::InvalidParameter`](#error) when `capacity`/`num_bits`/
-`num_hashes` is zero or `rate` is outside `(0.0, 1.0)` or non-finite.
+`num_hashes` is zero, `num_hashes` is above 2048, `rate` is outside
+`(0.0, 1.0)` or non-finite, or the bit array is too large to allocate.
 
 ```rust
 use bloom_lib::BloomFilter;
@@ -149,12 +154,11 @@ assert_eq!(exact.num_hashes(), 5);
 ```
 
 ```rust
-// Adversary-resistant hashing with a randomly-seeded BuildHasher.
-use std::collections::hash_map::RandomState;
-use bloom_lib::BloomFilter;
+// Adversary-resistant hashing with a secret key.
+use bloom_lib::{hash::KeyedHashBuilder, BloomFilter};
 
-let filter: BloomFilter<&str, RandomState> =
-    BloomFilter::with_hasher(1_000, 0.01, RandomState::new()).unwrap();
+let filter: BloomFilter<str, KeyedHashBuilder> =
+    BloomFilter::with_hasher(1_000, 0.01, KeyedHashBuilder::random()).unwrap();
 ```
 
 <h4 id="bloomfilter-membership">Membership operations</h4>
@@ -247,11 +251,19 @@ assert!(d.merge(&c).is_err());
 
 <h4 id="bloomfilter-serialization">Serialization (<code>serde</code> feature)</h4>
 
-With the `serde` feature, `BloomFilter` derives `Serialize` and `Deserialize`.
-The bit array and geometry are serialized; the hasher is not (it is rebuilt with
-`S::default()` on deserialization, which is exactly correct for the stateless
-`DefaultHashBuilder`). Because the default hasher is deterministic, a filter
-serialized on one machine queries identically on another.
+With the `serde` feature, `BloomFilter` implements `Serialize` and
+`Deserialize`. The bit array and geometry are serialized; the hasher is not (it
+is rebuilt with `S::default()` on deserialization, which is correct for the
+stateless `DefaultHashBuilder`). Because the default hasher is deterministic
+and hashes the same way on every target, a filter serialized on one machine
+queries identically on another, whatever its pointer width or byte order. Do
+not persist a filter built with `RandomState`; for keyed filters see
+[Hashing](#hashing).
+
+`Deserialize` validates the input: the word count must match the bit count, no
+bit beyond the bit count may be set, and the hash count must be in `1..=2048`.
+Anything else is an error. All structures validate this way; see
+[Untrusted serialized state](#untrusted-state).
 
 ```rust
 # #[cfg(feature = "serde")] {
@@ -563,16 +575,53 @@ Source: `src/hash.rs`
 
 Every structure is generic over [`core::hash::BuildHasher`] and defaults to the
 deterministic [`DefaultHashBuilder`](#defaulthashbuilder). Deterministic hashing
-makes filters reproducible, mergeable, and stable across serialization. Substitute
-a randomly-seeded hasher when inputs are untrusted.
+makes filters reproducible, mergeable, and stable across serialization. Use
+[`KeyedHashBuilder`](#keyedhashbuilder) when inputs are untrusted.
+
+**Portability.** Both hashers feed integers in little-endian byte order and
+widen `usize`/`isize` (including the length prefix of slices, `str` and `Vec`)
+to 64 bits, so a key hashes to the same value on every target. The values are
+the ones 1.0.0 produced on x86_64 and aarch64. A slice or `Vec` of multi-byte
+integers is the exception: the standard library hashes it as one block of
+native-endian bytes, so it differs on big-endian targets. Prefer `[u8]`, `str`
+or single integers as keys for persisted state.
+
+**Persisting with a hasher.** Serialized state never contains the hasher, and
+deserializing rebuilds it with `S::default()`. That is wrong for `RandomState`,
+whose `Default` draws a new key: a restored structure reports almost every
+stored item absent, so never persist one. `KeyedHashBuilder` has no `Default`;
+deserialize the structure with the default hasher type and attach the key again
+with `replace_hasher`, which every structure provides:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `replace_hasher` | `fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> Self<T, S2>` | Same state, new hasher. Nothing is rehashed, so `hasher` must hash like the original. |
+
+```rust
+# #[cfg(feature = "serde")] {
+use bloom_lib::{hash::KeyedHashBuilder, BloomFilter};
+
+let key = [9u8; 16]; // from your secret store
+let mut filter = BloomFilter::<str, _>::with_hasher(1_000, 0.01, KeyedHashBuilder::new(key))
+    .unwrap();
+filter.insert("kept");
+let json = serde_json::to_string(&filter).unwrap();
+
+let restored = serde_json::from_str::<BloomFilter<str>>(&json)
+    .unwrap()
+    .replace_hasher(KeyedHashBuilder::new(key));
+assert!(restored.contains("kept"));
+# }
+```
 
 <h4 id="defaulthasher"><code>DefaultHasher</code></h4>
 
 A fast, non-cryptographic 64-bit hasher implementing
 [`core::hash::Hasher`](https://doc.rust-lang.org/core/hash/trait.Hasher.html). It
 folds input through a 64×64-bit multiply-fold and mixes the input length into the
-finalizer, so values differing only by trailing zero bytes do not collide. Not
-suitable for authentication.
+finalizer, so values differing only by trailing zero bytes do not collide. It is
+not collision resistant: with the seed known (the default seed is public),
+colliding keys can be computed directly. Use `KeyedHasher` for untrusted input.
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -605,6 +654,63 @@ use bloom_lib::hash::DefaultHashBuilder;
 let builder = DefaultHashBuilder::default();
 assert_eq!(builder.hash_one("key"), builder.hash_one("key"));
 ```
+
+<h4 id="keyedhasher"><code>KeyedHasher</code></h4>
+
+SipHash-2-4 with a 128-bit secret key, implementing `Hasher`. Without the key an
+attacker cannot compute hash values or construct collisions. It is slower than
+`DefaultHasher`, roughly two to three times for short keys. Its `Debug` output
+does not show the key-derived state.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `const fn new(key: [u8; 16]) -> Self` | Creates a hasher with the given key. |
+
+<h4 id="keyedhashbuilder"><code>KeyedHashBuilder</code></h4>
+
+A [`BuildHasher`] that yields `KeyedHasher` instances with a secret key. Use it
+when an adversary can choose the items. Structures merge, and deserialized
+structures answer correctly, only with the same key. It implements `Clone`,
+`Copy`, `Debug` (without the key), and under `serde` `Serialize`/`Deserialize`
+so the key can be stored; treat that output as a secret. It does not implement
+`Default`, so a structure using it cannot be deserialized with a made-up key.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `const fn new(key: [u8; 16]) -> Self` | Creates a builder with the given key. |
+| `random` | `fn random() -> Self` | A fresh key from the OS random source (`std` only). |
+| `key` | `const fn key(&self) -> [u8; 16]` | Returns the key, so it can be stored. |
+
+```rust
+use bloom_lib::{hash::KeyedHashBuilder, HyperLogLog};
+
+let mut hll: HyperLogLog<[u8], _> =
+    HyperLogLog::with_hasher(14, KeyedHashBuilder::random()).unwrap();
+hll.insert(b"client-supplied");
+assert_eq!(hll.count(), 1);
+```
+
+<br>
+
+<h3 id="untrusted-state">Untrusted serialized state</h3>
+
+With the `serde` feature every structure's `Deserialize` checks its fields
+against each other and against the size of the data, and returns an error for
+anything a constructor could not have produced:
+
+| Structure | Checks |
+|-----------|--------|
+| `BloomFilter` | `num_bits >= 1`; word count is `ceil(num_bits / 64)`; no bit set beyond `num_bits`; `num_hashes` in `1..=2048`. |
+| `CountMinSketch` | `width >= 1`, `depth >= 1`; counter count is `width * depth`. |
+| `CuckooFilter` | `mask + 1` is a power of two; slot count is `4 * (mask + 1)`; a victim has a non-zero fingerprint and an index below `mask + 1`; `len` equals the stored fingerprints; relocation state non-zero. |
+| `HyperLogLog` | `precision` in `4..=18`; `2^precision` registers; no register above `65 - precision`. |
+| `MinHash` | signature not empty. |
+| `TopK` | the inner sketch as above; `k >= 1`; at most `k` monitored items. |
+
+So a decoded structure cannot panic or loop on a query: the work per query is
+bounded by the hash-count cap or by the size of the data. Validation does not
+make the content honest. A well-formed filter can still have every bit set, so
+only trust answers from sources you trust.
 
 <br>
 
@@ -660,8 +766,8 @@ filter.insert("hello");
 assert!(filter.contains("hello"));
 ```
 
-The prelude includes `Error`, `DefaultHasher`, `DefaultHashBuilder`, and (with
-`alloc`) `BloomFilter`, `CuckooFilter`, `CountMinSketch`, `HyperLogLog`,
+The prelude includes `Error`, `DefaultHasher`, `DefaultHashBuilder`,
+`KeyedHasher`, `KeyedHashBuilder`, and (with `alloc`) `BloomFilter`, `CuckooFilter`, `CountMinSketch`, `HyperLogLog`,
 `MinHash`, and `TopK`.
 
 <br>
@@ -680,7 +786,8 @@ The frozen surface is:
 - **Error**: `Error` and its variants. The enum is `#[non_exhaustive]`, so new
   variants may be **added** in a minor release; downstream `match`es must already
   carry a wildcard arm.
-- **Hashing**: `DefaultHasher`, `DefaultHashBuilder`.
+- **Hashing**: `DefaultHasher`, `DefaultHashBuilder`, and from 1.1.0
+  `KeyedHasher`, `KeyedHashBuilder`.
 - **Top level**: `VERSION` and the `prelude` module.
 - **Features**: `std` (default), `alloc`, `serde`, with their documented
   implications.
@@ -688,15 +795,23 @@ The frozen surface is:
 What is **not** covered by the SemVer promise, and may change in a minor
 release:
 
-- The exact bit/register layout produced by a given constructor (the *sizing
-  math*), and therefore the precise byte content of serialized state. Serialized
-  data is portable across platforms of the same release, not guaranteed across
-  major-version sizing changes.
-- The exact hash values produced by `DefaultHasher` (it is not a stable hash for
-  cross-version persistence; only its statistical quality is part of the
-  contract).
 - Estimation results to the last digit; only the documented error bounds are
   guaranteed.
+
+**Persisted state.** Callers store serialized filters and query them later, so
+from 1.1.0 the following are held fixed for the rest of 1.x, and golden tests
+(`tests/golden.rs`, run on 64-bit, 32-bit and big-endian targets in CI) fail if
+they change:
+
+- the hash values of `DefaultHasher` and `KeyedHasher` for a given input, on
+  every target (they equal what 1.0.0 produced on x86_64 and aarch64);
+- the serialized form of every structure, and the geometry the constructors
+  derive from their parameters.
+
+Changing any of these would make stored state answer wrongly, so it would need
+a major version. bloom-lib 1.0.0 hashed with the native byte order and pointer
+width, so state written by 1.0.0 on a 32-bit or big-endian target does not
+match 1.1.0; state written on x86_64 or aarch64 does.
 
 The MSRV (Rust 1.75) is treated as a compatibility surface: raising it is a
 minor-version change, announced in the changelog.
@@ -707,8 +822,7 @@ minor-version change, announced in the changelog.
 
 - **Determinism.** The default hasher uses a fixed seed. This is what makes
   filters mergeable and serialized state portable, but it is not a defence
-  against adversarial collisions; use a randomly-seeded `BuildHasher` for
-  untrusted input.
+  against adversarial collisions; use `KeyedHashBuilder` for untrusted input.
 - **No false negatives.** A Bloom filter never reports an inserted item as
   absent. False positives are the only error mode, and their rate is what you
   configure.

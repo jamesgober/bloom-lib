@@ -4,7 +4,7 @@ use core::hash::{BuildHasher, Hash};
 
 use alloc::vec::Vec;
 
-use crate::{count_min::CountMinSketch, hash::DefaultHashBuilder, Error};
+use crate::{count_min::CountMinSketch, hash::DefaultHashBuilder, util::TOO_LARGE, Error};
 
 /// One monitored item and its estimated frequency.
 #[derive(Debug, Clone)]
@@ -50,13 +50,10 @@ struct Entry<T> {
 /// assert_eq!(ranked.len(), 3); // only k items are kept
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(
     feature = "serde",
-    serde(bound(
-        serialize = "CountMinSketch<T, S>: serde::Serialize, T: serde::Serialize",
-        deserialize = "CountMinSketch<T, S>: serde::Deserialize<'de>, T: serde::Deserialize<'de>"
-    ))
+    serde(bound(serialize = "CountMinSketch<T, S>: serde::Serialize, T: serde::Serialize"))
 )]
 pub struct TopK<T, S = DefaultHashBuilder> {
     sketch: CountMinSketch<T, S>,
@@ -128,11 +125,14 @@ where
             });
         }
         let sketch = CountMinSketch::with_hasher(epsilon, delta, hasher)?;
-        Ok(Self {
-            sketch,
-            entries: Vec::with_capacity(k),
-            k,
-        })
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(k)
+            .map_err(|_| Error::InvalidParameter {
+                param: "k",
+                reason: TOO_LARGE,
+            })?;
+        Ok(Self { sketch, entries, k })
     }
 
     /// Records one occurrence of `item`, updating the sketch and the top set.
@@ -275,6 +275,66 @@ where
         self.sketch.clear();
         self.entries.clear();
     }
+}
+
+impl<T, S> TopK<T, S> {
+    /// Returns the same tracker with its hasher replaced by `hasher`.
+    ///
+    /// Serialized state does not include the hasher, so this is how a
+    /// tracker built with a keyed hasher is restored: deserialize it with the
+    /// default hasher type, then attach the original key. Nothing is
+    /// rehashed. `hasher` must hash exactly like the one the tracker was
+    /// built with, or its frequency estimates become meaningless.
+    #[must_use]
+    pub fn replace_hasher<S2: BuildHasher>(self, hasher: S2) -> TopK<T, S2> {
+        TopK {
+            sketch: self.sketch.replace_hasher(hasher),
+            entries: self.entries,
+            k: self.k,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T, S> serde::Deserialize<'de> for TopK<T, S>
+where
+    CountMinSketch<T, S>: serde::Deserialize<'de>,
+    T: serde::Deserialize<'de>,
+{
+    /// Decodes a tracker and checks it: the sketch is validated as a
+    /// [`CountMinSketch`], `k` must be non-zero, and at most `k` items may be
+    /// monitored.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::util::invalid;
+
+        let raw = RawTopK::<T, S>::deserialize(deserializer)?;
+        if raw.k == 0 {
+            return Err(invalid("k", "must be greater than zero"));
+        }
+        if raw.entries.len() > raw.k {
+            return Err(invalid("entries", "more than k items are monitored"));
+        }
+        Ok(Self {
+            sketch: raw.sketch,
+            entries: raw.entries,
+            k: raw.k,
+        })
+    }
+}
+
+/// The serialized form of [`TopK`], decoded before any invariant is checked.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(
+    rename = "TopK",
+    bound(
+        deserialize = "CountMinSketch<T, S>: serde::Deserialize<'de>, T: serde::Deserialize<'de>"
+    )
+)]
+struct RawTopK<T, S> {
+    sketch: CountMinSketch<T, S>,
+    entries: Vec<Entry<T>>,
+    k: usize,
 }
 
 #[cfg(test)]
